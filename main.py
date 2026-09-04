@@ -1,13 +1,8 @@
+
 # ==============================================================================
-# HIGH-PROBABILITY ZONE SIGNAL BOT – RENDER READY (NO MT5)
-# Uses public market data APIs | Telegram signals only | Wide SL/TP logic
+# HIGH-PROBABILITY ZONE SIGNAL BOT – RENDER + TWELVE DATA
+# Human-style Telegram signals | Wide SL/TP | Real-time | Startup test
 # ==============================================================================
-"""
-Deploy this on Render as a Web Service.
-It does NOT need MetaTrader 5.
-It fetches live prices via public APIs, runs the same zone + probability logic,
-and sends only high-probability signals to your Telegram.
-"""
 
 import os
 import time
@@ -23,7 +18,6 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-# Optional: FastAPI keeps the Render service alive with a health endpoint
 try:
     from fastapi import FastAPI
     from fastapi.responses import PlainTextResponse
@@ -40,34 +34,39 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-7s | %(message)s",
     handlers=[logging.StreamHandler()]
 )
-logger = logging.getLogger("RenderHighProb")
+logger = logging.getLogger("HighProb")
 
 # ==============================================================================
-# CONFIG – set these as Environment Variables on Render
+# CONFIG
 # ==============================================================================
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Symbols we support (mapped to free data sources)
-# You can add more later
-SYMBOLS = ["XAUUSD", "BTCUSD"]
+# Twelve Data API Key
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "abb27fe4fa8749d8a20a042ef4d100ee")
 
-# High-probability settings (same philosophy as before)
-REV_PROB_THRESHOLD = 0.78
-MIN_TOUCHES = 4
-MIN_ZONE_CONFIDENCE = 0.62
-SL_ATR_MULT = 3.2          # wide stop
-TP_ATR_MULT = 9.5          # high R:R ≈ 1:3
-COOLDOWN_SEC = 900         # 15 min between signals per symbol
-TICK_BUFFER = 600
-ATR_PERIOD = 40
-ZONE_EPS_ATR = 0.38
-ZONE_DECAY = 0.00025
-ZONE_DEAD_TIME = 1800
-SWING_K = 4
+# Symbols (Twelve Data format -> internal name)
+SYMBOLS = {
+    "XAU/USD": "XAUUSD",
+    "BTC/USD": "BTCUSD",
+}
+
+# Signal quality
+REV_PROB_THRESHOLD = 0.72
+MIN_TOUCHES = 3
+MIN_ZONE_CONFIDENCE = 0.55
+SL_ATR_MULT = 3.0
+TP_ATR_MULT = 9.0
+COOLDOWN_SEC = 720
+TICK_BUFFER = 500
+ATR_PERIOD = 30
+ZONE_EPS_ATR = 0.40
+ZONE_DECAY = 0.0003
+ZONE_DEAD_TIME = 1500
+SWING_K = 3
 RSI_PERIOD = 14
-POLL_INTERVAL = 8          # seconds between price fetches (Render friendly)
+POLL_INTERVAL = 12
 
 # ==============================================================================
 # DATA STRUCTURES
@@ -83,26 +82,27 @@ class Zone:
     anchors: List[float] = field(default_factory=list)
     strength: float = 0.5
 
-
 # ==============================================================================
 # GLOBAL STATE
 # ==============================================================================
 price_buffer: Dict[str, collections.deque] = {
-    s: collections.deque(maxlen=TICK_BUFFER) for s in SYMBOLS
+    s: collections.deque(maxlen=TICK_BUFFER) for s in SYMBOLS.values()
 }
-zones: Dict[str, List[Zone]] = {s: [] for s in SYMBOLS}
-atr_cache: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
-rsi_cache: Dict[str, float] = {s: 50.0 for s in SYMBOLS}
-last_signal_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS}
-last_signal_hash: Dict[str, str] = {s: "" for s in SYMBOLS}
-htf_trend: Dict[str, str] = {s: "NEUTRAL" for s in SYMBOLS}
+zones: Dict[str, List[Zone]] = {s: [] for s in SYMBOLS.values()}
+atr_cache: Dict[str, float] = {s: 0.0 for s in SYMBOLS.values()}
+rsi_cache: Dict[str, float] = {s: 50.0 for s in SYMBOLS.values()}
+last_signal_time: Dict[str, float] = {s: 0.0 for s in SYMBOLS.values()}
+last_signal_hash: Dict[str, str] = {s: "" for s in SYMBOLS.values()}
+htf_trend: Dict[str, str] = {s: "NEUTRAL" for s in SYMBOLS.values()}
+last_price: Dict[str, float] = {s: 0.0 for s in SYMBOLS.values()}
+signal_count = 0
 
 # ==============================================================================
-# TELEGRAM
+# TELEGRAM – HUMAN STYLE
 # ==============================================================================
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials missing – set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID")
+        logger.warning("Telegram not configured")
         return False
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -116,103 +116,102 @@ def send_telegram(text: str) -> bool:
         with urllib.request.urlopen(req, timeout=12) as resp:
             ok = resp.status == 200
             if ok:
-                logger.info("Telegram signal delivered")
+                logger.info("Telegram delivered")
             return ok
     except Exception as e:
-        logger.error(f"Telegram failed: {e}")
+        logger.error(f"Telegram error: {e}")
         return False
 
 
-def format_signal(symbol: str, bias: str, price: float, sl: float, tp: float,
-                  prob: float, atr: float, zone_center: float, touches: int,
-                  rsi: float, htf: str) -> str:
+def human_signal(symbol: str, bias: str, price: float, sl: float, tp: float,
+                 prob: float, atr: float, zone_center: float, touches: int,
+                 rsi: float, htf: str) -> str:
     rr = abs(tp - price) / max(abs(price - sl), 1e-9)
-    emoji = "🟢 BUY" if bias == "BUY" else "🔴 SELL"
-    return (
-        f"<b>HIGH PROBABILITY SIGNAL</b>\n\n"
-        f"{emoji} <b>{symbol}</b>\n"
-        f"Entry ≈ <code>{price:.5f}</code>\n"
-        f"SL     <code>{sl:.5f}</code>\n"
-        f"TP     <code>{tp:.5f}</code>\n\n"
-        f"Risk:Reward ≈ <b>1:{rr:.1f}</b>\n"
-        f"Probability: <b>{prob*100:.1f}%</b>\n"
-        f"Zone touches: {touches}\n"
-        f"ATR: {atr:.5f} | RSI: {rsi:.1f}\n"
-        f"HTF Bias: {htf}\n"
-        f"Zone center: {zone_center:.5f}\n\n"
-        f"<i>Intended hold: 30 min – several hours</i>\n"
-        f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}"
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+    if bias == "BUY":
+        action = "Looking to buy"
+        emoji = "🟢"
+        reason = "price reacting from support with good confluence"
+    else:
+        action = "Looking to sell"
+        emoji = "🔴"
+        reason = "price rejecting resistance with decent momentum shift"
+
+    conf_text = "high conviction" if prob >= 0.80 else "solid setup"
+
+    msg = (
+        f"{emoji} <b>{symbol}</b> — {action}\n\n"
+        f"Entry zone: <b>{price:.2f}</b>\n"
+        f"Stop loss: <b>{sl:.2f}</b>\n"
+        f"Take profit: <b>{tp:.2f}</b>\n\n"
+        f"Risk : Reward ≈ <b>1 : {rr:.1f}</b>\n"
+        f"Probability: {prob*100:.0f}% ({conf_text})\n\n"
+        f"Why: {reason}\n"
+        f"Zone strength: {touches} touches | RSI {rsi:.0f} | HTF {htf}\n"
+        f"ATR: {atr:.2f}\n\n"
+        f"<i>Hold for the move — ideally 30 min+</i>\n"
+        f"{now}"
     )
+    return msg
 
 # ==============================================================================
-# MARKET DATA (NO MT5 – works on Render Linux)
+# TWELVE DATA
 # ==============================================================================
-def fetch_binance_price(symbol: str) -> Optional[float]:
-    """BTCUSDT from Binance public API"""
+def td_get(url: str) -> Optional[dict]:
     try:
-        url = "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"
-        with urllib.request.urlopen(url, timeout=8) as resp:
-            data = json.loads(resp.read().decode())
-            return float(data["price"])
+        req = urllib.request.Request(url, headers={"User-Agent": "HighProbBot/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode())
     except Exception as e:
-        logger.debug(f"Binance error: {e}")
+        logger.debug(f"TwelveData error: {e}")
         return None
 
 
-def fetch_gold_price() -> Optional[float]:
-    """
-    Free gold price sources (fallback chain).
-    1. metals-api style free endpoints are limited, so we use a simple public source.
-    For production you should replace with a reliable paid API (TwelveData, Polygon, etc.)
-    """
-    # Simple free source – may have rate limits
-    sources = [
-        "https://api.metalpriceapi.com/v1/latest?api_key=demo&base=USD&currencies=XAU",  # demo often limited
-    ]
-    # Fallback: use a public JSON that many free sites expose
+def fetch_price_twelvedata(td_symbol: str) -> Optional[float]:
+    url = (
+        f"https://api.twelvedata.com/price"
+        f"?symbol={urllib.parse.quote(td_symbol)}"
+        f"&apikey={TWELVEDATA_API_KEY}"
+    )
+    data = td_get(url)
+    if data and "price" in data:
+        try:
+            return float(data["price"])
+        except (TypeError, ValueError):
+            return None
+    if data and "code" in data:
+        logger.warning(f"TwelveData {td_symbol}: {data.get('message', data)}")
+    return None
+
+
+def fetch_time_series(td_symbol: str, interval: str = "1min", outputsize: int = 60) -> List[float]:
+    url = (
+        f"https://api.twelvedata.com/time_series"
+        f"?symbol={urllib.parse.quote(td_symbol)}"
+        f"&interval={interval}"
+        f"&outputsize={outputsize}"
+        f"&apikey={TWELVEDATA_API_KEY}"
+    )
+    data = td_get(url)
+    if not data or "values" not in data:
+        return []
     try:
-        # Alternative: Yahoo-style via a public proxy or just skip if fails
-        # For reliability on Render we use a lightweight approach
-        url = "https://data-asg.goldprice.org/dbXRates/USD"
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
-            # structure: {"items":[{"xauPrice": ....}]}
-            if "items" in data and len(data["items"]) > 0:
-                return float(data["items"][0].get("xauPrice", 0))
-    except Exception as e:
-        logger.debug(f"Gold source error: {e}")
-    return None
-
-
-def get_live_price(symbol: str) -> Optional[float]:
-    if symbol.upper() in ("BTCUSD", "BTCUSDT", "BTC"):
-        return fetch_binance_price(symbol)
-    if symbol.upper() in ("XAUUSD", "GOLD", "XAU"):
-        return fetch_gold_price()
-    return None
-
-
-def get_recent_closes(symbol: str, count: int = 100) -> List[float]:
-    """
-    Build a simple close series from successive live prices.
-    On Render we accumulate prices over time in the buffer.
-    For initial seed we just return what we have.
-    """
-    return list(price_buffer[symbol])[-count:]
+        closes = [float(v["close"]) for v in reversed(data["values"])]
+        return closes
+    except Exception:
+        return []
 
 # ==============================================================================
-# INDICATORS & ZONE LOGIC (same core as your good system)
+# INDICATORS + ZONE ENGINE
 # ==============================================================================
-def compute_atr_from_prices(prices: List[float], period: int = ATR_PERIOD) -> float:
-    if len(prices) < period + 2:
+def compute_atr(prices: List[float], period: int = ATR_PERIOD) -> float:
+    if len(prices) < period + 1:
         return 0.0
-    arr = np_diff = []
-    # Approximate true range from close-to-close for simplicity on tick stream
     diffs = [abs(prices[i] - prices[i-1]) for i in range(1, len(prices))]
     if len(diffs) < period:
-        return float(sum(diffs) / len(diffs)) if diffs else 0.0
-    return float(sum(diffs[-period:]) / period)
+        return sum(diffs) / len(diffs) if diffs else 0.0
+    return sum(diffs[-period:]) / period
 
 
 def compute_rsi(prices: List[float], period: int = RSI_PERIOD) -> float:
@@ -223,7 +222,7 @@ def compute_rsi(prices: List[float], period: int = RSI_PERIOD) -> float:
     losses = [-d if d < 0 else 0.0 for d in deltas]
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
+    if avg_loss <= 0:
         return 70.0 if avg_gain > 0 else 50.0
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
@@ -235,7 +234,7 @@ def detect_swing(buffer: collections.deque, k: int = SWING_K) -> Optional[Tuple[
     prices = list(buffer)
     mid_idx = -k - 1
     mid = prices[mid_idx]
-    left = prices[-2 * k - 1: mid_idx]
+    left = prices[-2*k-1:mid_idx]
     right = prices[-k:]
     if mid > max(left) and mid > max(right):
         return ("HIGH", mid)
@@ -255,8 +254,8 @@ def update_zones(symbol: str, anchor: float, atr: float, swing_type: Optional[st
             std = (sum((a - z.center)**2 for a in z.anchors) / len(z.anchors))**0.5
             z.width = std + 0.15 * atr
             z.touches += 1
-            z.confidence = min(1.0, z.confidence + 0.11)
-            z.strength = z.confidence * min(1.0, z.touches / 7.0)
+            z.confidence = min(1.0, z.confidence + 0.12)
+            z.strength = z.confidence * min(1.0, z.touches / 6.0)
             if swing_type == "HIGH":
                 z.polarity = "RESISTANCE"
             elif swing_type == "LOW":
@@ -266,8 +265,8 @@ def update_zones(symbol: str, anchor: float, atr: float, swing_type: Optional[st
     if not attached:
         pol = "RESISTANCE" if swing_type == "HIGH" else "SUPPORT" if swing_type == "LOW" else "NEUTRAL"
         zones[symbol].append(Zone(
-            center=anchor, width=0.25 * atr, anchors=[anchor],
-            polarity=pol, strength=0.35
+            center=anchor, width=0.28 * atr, anchors=[anchor],
+            polarity=pol, strength=0.4
         ))
 
 
@@ -286,7 +285,7 @@ def merge_zones(symbol: str, atr: float):
             touches = z1.touches + z2.touches
             conf = (z1.confidence + z2.confidence) / 2
             pol = z1.polarity if z1.polarity == z2.polarity else "NEUTRAL"
-            strength = conf * min(1.0, touches / 7.0)
+            strength = conf * min(1.0, touches / 6.0)
             zones[symbol][i] = Zone(center, width, touches, conf, pol,
                                     max(z1.last_touch_time, z2.last_touch_time),
                                     anchors, strength)
@@ -300,35 +299,35 @@ def process_zone_interactions(symbol: str, price: float, atr: float):
     for z in zones[symbol]:
         age = now - z.last_touch_time
         z.confidence *= math.exp(-ZONE_DECAY * age)
-        z.strength = z.confidence * min(1.0, z.touches / 7.0)
-        if abs(price - z.center) < z.width and age > 12:
+        z.strength = z.confidence * min(1.0, z.touches / 6.0)
+        if abs(price - z.center) < z.width and age > 10:
             z.touches += 1
             z.last_touch_time = now
-            z.confidence = min(1.0, z.confidence + 0.15)
-            z.strength = z.confidence * min(1.0, z.touches / 7.0)
+            z.confidence = min(1.0, z.confidence + 0.14)
+            z.strength = z.confidence * min(1.0, z.touches / 6.0)
 
 
 def prune_zones(symbol: str):
     now = time.time()
     zones[symbol] = [
         z for z in zones[symbol]
-        if z.confidence > 0.25 and (now - z.last_touch_time) < ZONE_DEAD_TIME
+        if z.confidence > 0.22 and (now - z.last_touch_time) < ZONE_DEAD_TIME
     ]
 
 
 def compute_reversal_probability(symbol: str, price: float, atr: float) -> List[Dict]:
     results = []
     prices = list(price_buffer[symbol])
-    if len(prices) < max(30, RSI_PERIOD + 5) or atr <= 0:
+    if len(prices) < 35 or atr <= 0:
         return results
 
-    velocity = [prices[i] - prices[i-1] for i in range(-7, 0)]
+    velocity = [prices[i] - prices[i-1] for i in range(-6, 0)]
     v_mean = sum(velocity) / len(velocity)
     v_norm = abs(v_mean) / atr
-    exhaustion = max(0.0, 1.0 - min(v_norm, 1.6) / 1.6)
+    exhaustion = max(0.0, 1.0 - min(v_norm, 1.5) / 1.5)
 
-    short_std = (sum((p - sum(prices[-18:])/18)**2 for p in prices[-18:]) / 18)**0.5
-    long_std  = (sum((p - sum(prices[-70:])/70)**2 for p in prices[-70:]) / 70)**0.5 + 1e-9
+    short_std = (sum((p - sum(prices[-15:])/15)**2 for p in prices[-15:]) / 15)**0.5
+    long_std  = (sum((p - sum(prices[-50:])/50)**2 for p in prices[-50:]) / 50)**0.5 + 1e-9
     compression = max(0.0, 1.0 - short_std / long_std)
 
     current_rsi = rsi_cache[symbol]
@@ -338,81 +337,110 @@ def compute_reversal_probability(symbol: str, price: float, atr: float) -> List[
         if z.touches < MIN_TOUCHES or z.confidence < MIN_ZONE_CONFIDENCE:
             continue
         dist = abs(price - z.center)
-        if dist > z.width * 1.08:
+        if dist > z.width * 1.1:
             continue
 
-        impulse = math.exp(-dist / (atr * 0.9))
+        impulse = math.exp(-dist / (atr * 0.95))
         approach = 0.0
         rsi_bonus = 0.0
 
         if z.polarity == "RESISTANCE":
-            approach = 0.15 * v_norm if v_mean > 0 else -0.06
-            rsi_bonus = 0.12 if current_rsi > 66 else (-0.08 if current_rsi < 36 else 0)
+            approach = 0.14 * v_norm if v_mean > 0 else -0.05
+            rsi_bonus = 0.11 if current_rsi > 65 else (-0.07 if current_rsi < 38 else 0)
         elif z.polarity == "SUPPORT":
-            approach = 0.15 * v_norm if v_mean < 0 else -0.06
-            rsi_bonus = 0.12 if current_rsi < 34 else (-0.08 if current_rsi > 64 else 0)
+            approach = 0.14 * v_norm if v_mean < 0 else -0.05
+            rsi_bonus = 0.11 if current_rsi < 35 else (-0.07 if current_rsi > 62 else 0)
         else:
             continue
 
-        # Simple HTF penalty/bonus
         htf_score = 0.0
         if z.polarity == "SUPPORT" and htf == "BULL":
-            htf_score = 0.12
+            htf_score = 0.11
         elif z.polarity == "RESISTANCE" and htf == "BEAR":
-            htf_score = 0.12
+            htf_score = 0.11
         elif z.polarity == "SUPPORT" and htf == "BEAR":
-            htf_score = -0.16
+            htf_score = -0.15
         elif z.polarity == "RESISTANCE" and htf == "BULL":
-            htf_score = -0.16
+            htf_score = -0.15
 
-        strength_score = 0.30 * z.strength
-        raw = (strength_score + 0.16 * exhaustion + 0.12 * compression +
-               0.13 * impulse + approach + rsi_bonus + htf_score)
+        strength_score = 0.28 * z.strength
+        raw = (strength_score + 0.15 * exhaustion + 0.11 * compression +
+               0.14 * impulse + approach + rsi_bonus + htf_score)
         prob = max(0.0, min(1.0, raw))
         results.append({"zone": z, "probability": prob})
     return results
 
 
-def update_simple_htf(symbol: str):
-    """Very light HTF bias from the price buffer itself."""
+def update_htf(symbol: str):
     prices = list(price_buffer[symbol])
-    if len(prices) < 80:
+    if len(prices) < 60:
         return
-    ema_fast = sum(prices[-21:]) / 21
-    ema_slow = sum(prices[-55:]) / 55
-    if ema_fast > ema_slow * 1.0005:
+    ema_fast = sum(prices[-20:]) / 20
+    ema_slow = sum(prices[-50:]) / 50
+    if ema_fast > ema_slow * 1.0006:
         htf_trend[symbol] = "BULL"
-    elif ema_fast < ema_slow * 0.9995:
+    elif ema_fast < ema_slow * 0.9994:
         htf_trend[symbol] = "BEAR"
     else:
         htf_trend[symbol] = "NEUTRAL"
 
 # ==============================================================================
-# MAIN SIGNAL LOOP
+# STARTUP + MAIN LOOP
 # ==============================================================================
+def seed_buffers():
+    logger.info("Seeding price buffers from Twelve Data...")
+    for td_sym, internal in SYMBOLS.items():
+        closes = fetch_time_series(td_sym, interval="1min", outputsize=80)
+        if closes:
+            for c in closes:
+                price_buffer[internal].append(c)
+            last_price[internal] = closes[-1]
+            logger.info(f"  {internal}: seeded {len(closes)} bars | last={closes[-1]:.2f}")
+        else:
+            logger.warning(f"  {internal}: could not seed – will wait for live prices")
+        time.sleep(1.5)
+
+
+def startup_test():
+    test_msg = (
+        "✅ <b>System online</b>\n\n"
+        "High-probability signal engine is running.\n"
+        "I will only send clean setups with proper Stop Loss and Take Profit.\n\n"
+        f"Watching: {', '.join(SYMBOLS.values())}\n"
+        f"Min probability: {int(REV_PROB_THRESHOLD*100)}%\n"
+        f"Target R:R ≈ 1:{TP_ATR_MULT/SL_ATR_MULT:.1f}\n\n"
+        f"<i>{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</i>"
+    )
+    ok = send_telegram(test_msg)
+    if ok:
+        logger.info("Startup test message sent to Telegram")
+    else:
+        logger.warning("Startup test failed – check TELEGRAM_BOT_TOKEN and CHAT_ID")
+
+
 def signal_loop():
-    logger.info("Signal engine started (Render mode – no MT5)")
+    global signal_count
+    logger.info("Real-time signal loop started")
     while True:
         try:
-            for symbol in SYMBOLS:
-                price = get_live_price(symbol)
+            for td_sym, symbol in SYMBOLS.items():
+                price = fetch_price_twelvedata(td_sym)
                 if price is None or price <= 0:
                     continue
 
                 price_buffer[symbol].append(price)
+                last_price[symbol] = price
 
-                # ATR & RSI
                 prices = list(price_buffer[symbol])
-                atr = compute_atr_from_prices(prices)
+                atr = compute_atr(prices)
                 atr_cache[symbol] = atr
                 rsi_cache[symbol] = compute_rsi(prices)
 
                 if atr <= 0 or len(prices) < 40:
                     continue
 
-                update_simple_htf(symbol)
+                update_htf(symbol)
 
-                # Zones
                 swing = detect_swing(price_buffer[symbol])
                 if swing:
                     update_zones(symbol, swing[1], atr, swing[0])
@@ -420,9 +448,9 @@ def signal_loop():
                 process_zone_interactions(symbol, price, atr)
                 prune_zones(symbol)
 
-                # High-prob signals only
                 reversals = compute_reversal_probability(symbol, price, atr)
                 now = time.time()
+
                 for r in reversals:
                     if r["probability"] < REV_PROB_THRESHOLD:
                         continue
@@ -432,17 +460,16 @@ def signal_loop():
                     if not bias:
                         continue
 
-                    # Cooldown + de-dupe
                     if now - last_signal_time.get(symbol, 0) < COOLDOWN_SEC:
                         continue
-                    sig_hash = f"{symbol}-{bias}-{round(zone.center, 2)}"
+                    sig_hash = f"{symbol}-{bias}-{round(zone.center, 1)}"
                     if last_signal_hash.get(symbol) == sig_hash:
                         continue
 
                     last_signal_time[symbol] = now
                     last_signal_hash[symbol] = sig_hash
+                    signal_count += 1
 
-                    # Calculate wide SL / TP
                     if bias == "BUY":
                         sl = price - SL_ATR_MULT * atr
                         tp = price + TP_ATR_MULT * atr
@@ -450,53 +477,63 @@ def signal_loop():
                         sl = price + SL_ATR_MULT * atr
                         tp = price - TP_ATR_MULT * atr
 
-                    msg = format_signal(
+                    msg = human_signal(
                         symbol, bias, price, sl, tp,
                         r["probability"], atr, zone.center,
                         zone.touches, rsi_cache[symbol], htf_trend[symbol]
                     )
                     send_telegram(msg)
-                    logger.info(f"SIGNAL {bias} {symbol} | Prob={r['probability']:.3f}")
+                    logger.info(
+                        f"SIGNAL #{signal_count} {bias} {symbol} @ {price:.2f} "
+                        f"| Prob={r['probability']:.2f} | SL={sl:.2f} TP={tp:.2f}"
+                    )
 
             time.sleep(POLL_INTERVAL)
         except Exception as e:
             logger.error(f"Loop error: {e}", exc_info=True)
-            time.sleep(15)
+            time.sleep(20)
 
 
 # ==============================================================================
-# FASTAPI HEALTH (keeps Render web service alive)
+# FASTAPI
 # ==============================================================================
 if HAS_FASTAPI:
-    app = FastAPI(title="HighProb Signal Bot")
+    app = FastAPI(title="HighProb Signals")
 
     @app.get("/")
-    def health():
+    def root():
         return {
-            "status": "running",
-            "symbols": SYMBOLS,
-            "telegram_configured": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+            "status": "live",
+            "engine": "High-Probability Zone System + Twelve Data",
+            "symbols": list(SYMBOLS.values()),
+            "signals_sent": signal_count,
+            "telegram": bool(TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID),
+            "twelvedata": bool(TWELVEDATA_API_KEY),
+            "min_probability": REV_PROB_THRESHOLD,
+            "last_prices": last_price,
             "time": datetime.now(timezone.utc).isoformat()
         }
 
     @app.get("/health")
-    def health_check():
+    def health():
         return PlainTextResponse("ok")
 
-
 # ==============================================================================
-# ENTRY POINT
+# MAIN
 # ==============================================================================
 if __name__ == "__main__":
-    logger.info("=" * 60)
-    logger.info("  RENDER HIGH-PROBABILITY SIGNAL BOT")
-    logger.info(f"  Symbols     : {SYMBOLS}")
-    logger.info(f"  Min Prob    : {REV_PROB_THRESHOLD}")
-    logger.info(f"  SL/TP ATR   : {SL_ATR_MULT}x / {TP_ATR_MULT}x  (R:R ≈ 1:{TP_ATR_MULT/SL_ATR_MULT:.1f})")
-    logger.info(f"  Telegram    : {'READY' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'NOT CONFIGURED'}")
-    logger.info("=" * 60)
+    logger.info("=" * 64)
+    logger.info("  HIGH-PROBABILITY SIGNAL BOT + TWELVE DATA")
+    logger.info(f"  Symbols      : {list(SYMBOLS.values())}")
+    logger.info(f"  Min Prob     : {REV_PROB_THRESHOLD}")
+    logger.info(f"  SL / TP      : {SL_ATR_MULT}x / {TP_ATR_MULT}x ATR")
+    logger.info(f"  TwelveData   : {'SET' if TWELVEDATA_API_KEY else 'MISSING'}")
+    logger.info(f"  Telegram     : {'SET' if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID else 'MISSING'}")
+    logger.info("=" * 64)
 
-    # Start signal engine in background
+    seed_buffers()
+    startup_test()
+
     t = threading.Thread(target=signal_loop, daemon=True)
     t.start()
 
@@ -504,6 +541,5 @@ if __name__ == "__main__":
         port = int(os.getenv("PORT", 10000))
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
     else:
-        # If no FastAPI, just keep the loop alive
         while True:
             time.sleep(60)
